@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width,initial-scale=1"/>
+    <title>Excel 模板识别与合并</title>
+    <link rel="stylesheet" href="/style.css"/>
+</head>
+<body>
+<div class="wrap">
+    <h1>📊 Excel 模板识别与合并工具</h1>
+
+    <div class="card">
+        <div class="section-title">1. 上传模板文件</div>
+        <div class="row">
+            <input id="templateFile" type="file" accept=".xlsx,.xls" />
+            <button id="btnUploadTemplate" class="btn primary" type="button">识别模板</button>
+        </div>
+        <div class="dropzone" id="templateDrop">
+            拖动模板文件到这里，或点击上方按钮选择（支持 .xlsx / .xls）
+        </div>
+        <div id="templateInfo" class="hint" style="margin-top:10px;"></div>
+    </div>
+
+    <div class="card">
+        <div class="section-title">2. 上传支行 Excel 合并</div>
+        <div class="row">
+            <input id="dataFiles" type="file" accept=".xlsx,.xls" multiple />
+            <button id="btnMerge" class="btn primary" type="button">开始合并</button>
+            <button id="btnExport" class="btn" type="button" disabled>导出汇总 Excel</button>
+        </div>
+        <div class="dropzone" id="dataDrop">
+            拖动多个支行文件到这里，或点击上方按钮选择（支持 .xlsx / .xls）
+        </div>
+        <div id="mergeStatus" class="hint" style="margin-top:10px;"></div>
+    </div>
+
+    <div class="card">
+        <div class="section-title">问题提示</div>
+        <div id="issueList" class="issues"></div>
+    </div>
+
+    <div class="card">
+        <div class="section-title">汇总预览（最多 50 行）</div>
+        <div id="previewTable"></div>
+    </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
