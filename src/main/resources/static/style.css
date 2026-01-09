@@ -55,7 +55,20 @@ h2{ margin:4px 0 0; }
     padding:18px 18px 14px;
     margin-top:16px;
 }
-
+.dropzone{
+    margin-top:10px;
+    padding:16px;
+    border:1px dashed #cbd5f5;
+    border-radius:12px;
+    background:var(--accent);
+    color:#475569;
+    font-size:13px;
+    transition:border-color .2s ease, background .2s ease;
+}
+.dropzone.dragging{
+    border-color:var(--primary);
+    background:#e6efff;
+}
 .row{
     display:flex;
     gap:12px;

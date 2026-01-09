@@ -62,7 +62,7 @@ function escapeHtml(value) {
 
 async function uploadTemplate(filesOverride) {
     const input = byId("templateFile");
-    const files = filesOverride || (input && input.files ? input.files : []);
+    const files = normalizeFiles(filesOverride, input);
     if (!files || files.length === 0) {
         setText("templateInfo", "请先选择模板文件。");
         return;
@@ -91,7 +91,7 @@ async function uploadTemplate(filesOverride) {
 
 async function mergeFiles(filesOverride) {
     const input = byId("dataFiles");
-    const files = filesOverride || (input && input.files ? input.files : []);
+    const files = normalizeFiles(filesOverride, input);
     if (!files || files.length === 0) {
         setText("mergeStatus", "请先选择支行 Excel 文件。");
         return;
@@ -133,13 +133,14 @@ document.addEventListener("DOMContentLoaded", () => {
     const btnExport = byId("btnExport");
     if (btnExport) btnExport.addEventListener("click", exportMerged);
 
-    bindDropZone("templateDrop", (files) => uploadTemplate(files));
-    bindDropZone("dataDrop", (files) => mergeFiles(files));
+    bindDropZone("templateDrop", "templateFile", (files) => uploadTemplate(files));
+    bindDropZone("dataDrop", "dataFiles", (files) => mergeFiles(files));
 });
 
-function bindDropZone(id, handler) {
+function bindDropZone(id, inputId, handler) {
     const zone = byId(id);
     if (!zone) return;
+    const input = inputId ? byId(inputId) : null;
 
     const toggle = (active) => zone.classList.toggle("dragging", active);
     const prevent = (e) => {
@@ -160,13 +161,52 @@ function bindDropZone(id, handler) {
         });
     });
     zone.addEventListener("drop", (e) => {
-        const files = Array.from(e.dataTransfer.files || []).filter((f) => isExcelFile(f));
+        const files = getDroppedFiles(e).filter((f) => isExcelFile(f));
         if (files.length === 0) {
             handler([]);
             return;
         }
+        syncInputFiles(input, files);
         handler(files);
     });
+}
+
+function normalizeFiles(filesOverride, input) {
+    const overrideFiles = toFileArray(filesOverride);
+    if (overrideFiles.length > 0) {
+        return overrideFiles;
+    }
+    return toFileArray(input && input.files ? input.files : []);
+}
+
+function toFileArray(files) {
+    if (!files) {
+        return [];
+    }
+    return Array.from(files).filter(Boolean);
+}
+
+function getDroppedFiles(event) {
+    const dataTransfer = event.dataTransfer;
+    if (!dataTransfer) {
+        return [];
+    }
+    if (dataTransfer.items && dataTransfer.items.length > 0) {
+        return Array.from(dataTransfer.items)
+            .filter((item) => item.kind === "file")
+            .map((item) => item.getAsFile())
+            .filter(Boolean);
+    }
+    return Array.from(dataTransfer.files || []);
+}
+
+function syncInputFiles(input, files) {
+    if (!input || !files || files.length === 0) {
+        return;
+    }
+    const dataTransfer = new DataTransfer();
+    files.forEach((file) => dataTransfer.items.add(file));
+    input.files = dataTransfer.files;
 }
 
 function isExcelFile(file) {
