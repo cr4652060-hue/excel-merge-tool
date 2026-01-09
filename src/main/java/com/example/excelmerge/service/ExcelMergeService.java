@@ -11,13 +11,14 @@ import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Pattern;
 
 @Service
 public class ExcelMergeService {
     private static final int HEADER_SCAN_LIMIT = 30;
     private static final int TYPE_SAMPLE_LIMIT = 50;
     private static final int PREVIEW_LIMIT = 50;
-
+    private static final Pattern HEADER_TEXT_PATTERN = Pattern.compile(".*[A-Za-z\\u4e00-\\u9fff].*");
     private final AtomicReference<TemplateDefinition> templateRef = new AtomicReference<>();
     private final AtomicReference<List<List<String>>> mergedRowsRef = new AtomicReference<>();
 
@@ -196,7 +197,8 @@ public class ExcelMergeService {
         int first = sheet.getFirstRowNum();
         int last = Math.min(sheet.getLastRowNum(), first + HEADER_SCAN_LIMIT);
         int bestRow = -1;
-        int bestCount = 0;
+        int bestTextCount = 0;
+        int bestNonEmptyCount = 0;
         DataFormatter fmt = new DataFormatter();
 
         for (int r = first; r <= last; r++) {
@@ -204,22 +206,36 @@ public class ExcelMergeService {
             if (row == null) {
                 continue;
             }
-            int count = 0;
+            int nonEmptyCount = 0;
+            int textCount = 0;
             for (int c = row.getFirstCellNum(); c < row.getLastCellNum(); c++) {
                 Cell cell = row.getCell(c);
                 String value = cell == null ? "" : fmt.formatCellValue(cell).trim();
-                if (!value.isBlank()) {
-                    count++;
+                if (value.isBlank()) {
+                    continue;
+                }
+                nonEmptyCount++;
+                if (isHeaderTextCell(cell, value)) {
+                    textCount++;
                 }
             }
-            if (count > bestCount) {
-                bestCount = count;
+            if (textCount == 0 && nonEmptyCount == 0) {
+                continue;
+            }
+            if (textCount > bestTextCount || (textCount == bestTextCount && nonEmptyCount > bestNonEmptyCount)) {
+                bestTextCount = textCount;
+                bestNonEmptyCount = nonEmptyCount;
                 bestRow = r;
             }
         }
-        return bestCount == 0 ? -1 : bestRow;
+        if (bestRow < 0) {
+            return -1;
+        }
+        if (bestTextCount == 0) {
+            return bestNonEmptyCount == 0 ? -1 : bestRow;
+        }
+        return bestRow;
     }
-
     private int findFirstNonEmptyRow(Sheet sheet) {
         int first = sheet.getFirstRowNum();
         int last = Math.min(sheet.getLastRowNum(), first + HEADER_SCAN_LIMIT);
@@ -401,5 +417,24 @@ public class ExcelMergeService {
         s = s.replaceAll("\\*", "");
         s = s.replaceAll("\\s+", "");
         return s.trim();
+    }
+
+    private boolean isHeaderTextCell(Cell cell, String value) {
+        if (cell != null) {
+            CellType cellType = cell.getCellType() == CellType.FORMULA
+                    ? cell.getCachedFormulaResultType()
+                    : cell.getCellType();
+            if (cellType == CellType.STRING) {
+                return true;
+            }
+        }
+        if (value == null) {
+            return false;
+        }
+        String trimmed = value.trim();
+        if (trimmed.isBlank()) {
+            return false;
+        }
+        return HEADER_TEXT_PATTERN.matcher(trimmed).matches();
     }
 }
