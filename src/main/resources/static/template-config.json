@@ -8,7 +8,7 @@
     {
       "name": "模板B",
       "matchHeaders": ["序号", "金额", "开户行"],
-      "requiredHeaders": ["序号", "金额"]
+      "requiredHeaders": ["金额"]
     },
     {
       "name": "模板C",

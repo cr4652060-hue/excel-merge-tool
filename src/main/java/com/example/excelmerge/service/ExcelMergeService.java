@@ -25,6 +25,7 @@ public class ExcelMergeService {
 
     private static final Pattern HEADER_TEXT_PATTERN = Pattern.compile(".*[A-Za-z\\u4e00-\\u9fff].*");
     private static final Pattern SERIAL_HEADER_PATTERN = Pattern.compile("^(序号|序|编号|行号|序列|no|No|NO)$");
+    private static final Pattern FIXED_VALUE_HEADER_PATTERN = Pattern.compile(".*(账户类型|账户类别).*");
     private static final Pattern NON_CORE_HEADER_PATTERN = Pattern.compile(".*(备注|说明|填报人|填表人|填报日期|填表日期).*");
     // ✅ 新增：说明行关键词
     private static final Pattern INSTRUCTION_KEYWORDS = Pattern.compile(
@@ -173,6 +174,9 @@ public class ExcelMergeService {
                         // =========================
 // 按校验等级处理空值
 // =========================
+                        if (isSerialHeader(norm)) {
+                            continue;
+                        }
                         if (value.isBlank()) {
                             if (validationLevel == ValidationLevel.STRICT
                                     && template.requiredNormalizedHeaders().contains(norm)) {
@@ -359,6 +363,9 @@ public class ExcelMergeService {
                 if (required == null || required.isBlank()) {
                     continue;
                 }
+                if (isIgnorableForRowDetection(required)) {
+                    continue;
+                }
                 Integer col = columnMap.get(required);
                 if (col == null) {
                     continue;
@@ -379,7 +386,9 @@ public class ExcelMergeService {
         for (int i = 0; i < coreHeaders.size(); i++) {
             String norm = coreHeaders.get(i);
             if (norm == null) continue;
-
+            if (isIgnorableForRowDetection(norm)) {
+                continue;
+            }
             Integer col = columnMap.get(norm);
             if (col == null) continue;
             hasMappedCore = true;
@@ -438,9 +447,25 @@ public class ExcelMergeService {
         if (SERIAL_HEADER_PATTERN.matcher(header).matches()) {
             return false;
         }
+        if (FIXED_VALUE_HEADER_PATTERN.matcher(header).matches()) {
+            return false;
+        }
         return !NON_CORE_HEADER_PATTERN.matcher(header).matches();
     }
+    private boolean isSerialHeader(String normalizedHeader) {
+        if (normalizedHeader == null || normalizedHeader.isBlank()) {
+            return false;
+        }
+        return SERIAL_HEADER_PATTERN.matcher(normalizedHeader.trim()).matches();
+    }
 
+    private boolean isIgnorableForRowDetection(String normalizedHeader) {
+        if (normalizedHeader == null || normalizedHeader.isBlank()) {
+            return true;
+        }
+        String header = normalizedHeader.trim();
+        return isSerialHeader(header) || FIXED_VALUE_HEADER_PATTERN.matcher(header).matches();
+    }
 
     // =========================
     // ✅ 表头定位：改进版

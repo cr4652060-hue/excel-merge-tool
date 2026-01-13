@@ -23,7 +23,8 @@ public class ExcelMergeService {
     private static final int PREVIEW_LIMIT = 500;
 
     private static final Pattern HEADER_TEXT_PATTERN = Pattern.compile(".*[A-Za-z\\u4e00-\\u9fff].*");
-
+    private static final Pattern SERIAL_HEADER_PATTERN = Pattern.compile("^(序号|序|编号|行号|序列|no|No|NO)$");
+    private static final Pattern FIXED_VALUE_HEADER_PATTERN = Pattern.compile(".*(账户类型|账户类别).*");
     // ✅ 新增：说明行/标题行关键词（内网填报模板常见话术）
     private static final Pattern INSTRUCTION_KEYWORDS = Pattern.compile(
             ".*(填写|说明|注意|示例|要求|口径|备注|提示|温馨提示|如实|以下|请按|请填写|填报|填表|规则|校验|检查).*"
@@ -157,6 +158,9 @@ public class ExcelMergeService {
                         // =========================
 // 按校验等级处理空值
 // =========================
+                        if (isSerialHeader(norm)) {
+                            continue;
+                        }
                         if (value.isBlank()) {
                             if (validationLevel == ValidationLevel.STRICT
                                     && isRequiredHeader(template.headers().get(c))) {
@@ -260,8 +264,7 @@ public class ExcelMergeService {
         if (h.contains("金额") || h.contains("备注")) return false;
 
         // 必填项（按你们网点表结构）
-        return h.contains("序号")
-                || h.contains("单位") || h.contains("网点")
+        return h.contains("单位") || h.contains("网点")
                 || h.contains("账号") || h.contains("卡号")
                 || h.contains("姓名")
                 || h.contains("账户类型") || h.contains("账户类别");
@@ -282,8 +285,8 @@ public class ExcelMergeService {
             String norm = normalizedHeaders.get(i);
             if (norm == null) continue;
 
-            // 序号不算数据
-            if (norm.contains("序号")) continue;
+            if (isIgnorableForRowDetection(norm)) continue;
+
 
             Integer col = columnMap.get(norm);
             if (col == null) continue;
@@ -297,6 +300,20 @@ public class ExcelMergeService {
         return false;
     }
 
+    private boolean isSerialHeader(String normalizedHeader) {
+        if (normalizedHeader == null || normalizedHeader.isBlank()) {
+            return false;
+        }
+        return SERIAL_HEADER_PATTERN.matcher(normalizedHeader.trim()).matches();
+    }
+
+    private boolean isIgnorableForRowDetection(String normalizedHeader) {
+        if (normalizedHeader == null || normalizedHeader.isBlank()) {
+            return true;
+        }
+        String header = normalizedHeader.trim();
+        return isSerialHeader(header) || FIXED_VALUE_HEADER_PATTERN.matcher(header).matches();
+    }
 
     // =========================
     // ✅ 表头定位：改进版
