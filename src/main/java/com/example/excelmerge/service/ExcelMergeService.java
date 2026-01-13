@@ -24,7 +24,8 @@ public class ExcelMergeService {
     private static final int PREVIEW_LIMIT = 500;
 
     private static final Pattern HEADER_TEXT_PATTERN = Pattern.compile(".*[A-Za-z\\u4e00-\\u9fff].*");
-
+    private static final Pattern SERIAL_HEADER_PATTERN = Pattern.compile("^(序号|序|编号|行号|序列|no|No|NO)$");
+    private static final Pattern NON_CORE_HEADER_PATTERN = Pattern.compile(".*(备注|说明|填报人|填表人|填报日期|填表日期).*");
     // ✅ 新增：说明行关键词
     private static final Pattern INSTRUCTION_KEYWORDS = Pattern.compile(
             ".*(填写|说明|注意|示例|要求|口径|备注|提示|温馨提示|如实|以下|请按|请填写|填报|填表|规则|校验|检查).*"
@@ -118,7 +119,14 @@ public class ExcelMergeService {
                     continue;
                 }
 
-                Map<String, Integer> columnMap = buildColumnMap(sheet.getRow(headerRowIndex));
+                ColumnMapping columnMapping = buildColumnMapping(sheet.getRow(headerRowIndex));
+                Map<String, Integer> columnMap = columnMapping.columnMap();
+                if (!columnMapping.duplicateHeaders().isEmpty()) {
+                    for (String duplicate : columnMapping.duplicateHeaders()) {
+                        issues.add(new MergeIssue(file.getOriginalFilename(), sheet.getSheetName(), null,
+                                resolveHeaderName(template, duplicate), "列重复，可能导致字段错位"));
+                    }
+                }
                 Set<String> missingColumns = new HashSet<>();
                 for (int i = 0; i < template.normalizedHeaders().size(); i++) {
                     String norm = template.normalizedHeaders().get(i);
@@ -131,6 +139,7 @@ public class ExcelMergeService {
 
                 int lastRow = sheet.getLastRowNum();
                 DataFormatter fmt = new DataFormatter();
+                List<String> coreHeaders = resolveCoreHeaders(template);
                 for (int r = headerRowIndex + 1; r <= lastRow; r++) {
                     Row row = sheet.getRow(r);
                     // ✅ 1) 跳过空行
@@ -141,7 +150,7 @@ public class ExcelMergeService {
 
                     // ✅ 3) 只有“真正填写了内容”的行才算数据行
                     //     （只填序号、或者末尾空行，都直接跳过）
-                    if (!isMeaningfulDataRow(row, fmt, template.normalizedHeaders(), columnMap)) {
+                    if (!isMeaningfulDataRow(row, fmt, coreHeaders, columnMap)) {
                         continue;
                     }
                     List<String> values = new ArrayList<>();
@@ -337,16 +346,13 @@ public class ExcelMergeService {
     // ② 判断这一行是不是“真实数据行”
 //    只填了序号不算；只要【除序号外】任意列有值，才算数据行
     private boolean isMeaningfulDataRow(Row row, DataFormatter fmt,
-                                        List<String> normalizedHeaders,
+                                        List<String> coreHeaders,
                                         Map<String, Integer> columnMap) {
         if (row == null) return false;
 
-        for (int i = 0; i < normalizedHeaders.size(); i++) {
-            String norm = normalizedHeaders.get(i);
+        for (int i = 0; i < coreHeaders.size(); i++) {
+            String norm = coreHeaders.get(i);
             if (norm == null) continue;
-
-            // 序号不算数据
-            if (norm.contains("序号")) continue;
 
             Integer col = columnMap.get(norm);
             if (col == null) continue;
@@ -360,6 +366,42 @@ public class ExcelMergeService {
         return false;
     }
 
+    private List<String> resolveCoreHeaders(TemplateDefinition template) {
+        if (template == null) {
+            return List.of();
+        }
+        List<String> candidates = new ArrayList<>();
+        Set<String> required = template.requiredNormalizedHeaders();
+        if (required != null && !required.isEmpty()) {
+            for (String header : required) {
+                if (isCoreHeader(header)) {
+                    candidates.add(header);
+                }
+            }
+        }
+        if (candidates.isEmpty()) {
+            for (String header : template.normalizedHeaders()) {
+                if (isCoreHeader(header)) {
+                    candidates.add(header);
+                }
+            }
+        }
+        if (candidates.isEmpty()) {
+            return template.normalizedHeaders();
+        }
+        return candidates;
+    }
+
+    private boolean isCoreHeader(String normalizedHeader) {
+        if (normalizedHeader == null || normalizedHeader.isBlank()) {
+            return false;
+        }
+        String header = normalizedHeader.trim();
+        if (SERIAL_HEADER_PATTERN.matcher(header).matches()) {
+            return false;
+        }
+        return !NON_CORE_HEADER_PATTERN.matcher(header).matches();
+    }
 
 
     // =========================
@@ -554,10 +596,11 @@ public class ExcelMergeService {
     // 原有逻辑保持不动
     // =========================
 
-    private Map<String, Integer> buildColumnMap(Row headerRow) {
+    private ColumnMapping buildColumnMapping(Row headerRow) {
         Map<String, Integer> map = new LinkedHashMap<>();
+        Set<String> duplicates = new LinkedHashSet<>();
         if (headerRow == null) {
-            return map;
+            return new ColumnMapping(map, duplicates);
         }
         DataFormatter fmt = new DataFormatter();
         for (int c = headerRow.getFirstCellNum(); c < headerRow.getLastCellNum(); c++) {
@@ -566,9 +609,17 @@ public class ExcelMergeService {
             if (name.isBlank()) {
                 continue;
             }
-            map.put(normalizeHeader(name), c);
+            String normalized = normalizeHeader(name);
+            if (normalized.isBlank()) {
+                continue;
+            }
+            if (map.containsKey(normalized)) {
+                duplicates.add(normalized);
+                continue;
+            }
+            map.put(normalized, c);
         }
-        return map;
+        return new ColumnMapping(map, duplicates);
     }
 
     private List<ColumnType> detectColumnTypes(Sheet sheet, int dataStartRow, List<Integer> columnIndexes) {
@@ -686,6 +737,21 @@ public class ExcelMergeService {
         s = s.replaceAll("\\*", "");
         s = s.replaceAll("\\s+", "");
         return s.trim();
+    }
+    private String resolveHeaderName(TemplateDefinition template, String normalizedHeader) {
+        if (template == null || normalizedHeader == null) {
+            return normalizedHeader;
+        }
+        List<String> normalizedHeaders = template.normalizedHeaders();
+        for (int i = 0; i < normalizedHeaders.size(); i++) {
+            if (normalizedHeader.equals(normalizedHeaders.get(i))) {
+                return template.headers().get(i);
+            }
+        }
+        return normalizedHeader;
+    }
+
+    private record ColumnMapping(Map<String, Integer> columnMap, Set<String> duplicateHeaders) {
     }
 
     private boolean isHeaderTextCell(Cell cell, String value) {
