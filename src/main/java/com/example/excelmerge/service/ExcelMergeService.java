@@ -124,8 +124,9 @@ public class ExcelMergeService {
                 if (!columnMapping.duplicateHeaders().isEmpty()) {
                     for (String duplicate : columnMapping.duplicateHeaders()) {
                         issues.add(new MergeIssue(file.getOriginalFilename(), sheet.getSheetName(), null,
-                                resolveHeaderName(template, duplicate), "列重复，可能导致字段错位"));
+                                resolveHeaderName(template, duplicate), "列重复，已跳过该文件"));
                     }
+                    continue;
                 }
                 Set<String> missingColumns = new HashSet<>();
                 for (int i = 0; i < template.normalizedHeaders().size(); i++) {
@@ -150,7 +151,7 @@ public class ExcelMergeService {
 
                     // ✅ 3) 只有“真正填写了内容”的行才算数据行
                     //     （只填序号、或者末尾空行，都直接跳过）
-                    if (!isMeaningfulDataRow(row, fmt, coreHeaders, columnMap)) {
+                    if (!isMeaningfulDataRow(row, fmt, coreHeaders, template.requiredNormalizedHeaders(), columnMap)) {
                         continue;
                     }
                     List<String> values = new ArrayList<>();
@@ -347,15 +348,41 @@ public class ExcelMergeService {
 //    只填了序号不算；只要【除序号外】任意列有值，才算数据行
     private boolean isMeaningfulDataRow(Row row, DataFormatter fmt,
                                         List<String> coreHeaders,
+                                        Set<String> requiredHeaders,
                                         Map<String, Integer> columnMap) {
         if (row == null) return false;
+        if (row.getZeroHeight()) return false;
 
+        if (requiredHeaders != null && !requiredHeaders.isEmpty()) {
+            boolean hasMappedRequired = false;
+            for (String required : requiredHeaders) {
+                if (required == null || required.isBlank()) {
+                    continue;
+                }
+                Integer col = columnMap.get(required);
+                if (col == null) {
+                    continue;
+                }
+                hasMappedRequired = true;
+                Cell cell = row.getCell(col);
+                String v = (cell == null) ? "" : fmt.formatCellValue(cell).trim();
+                if (!v.isBlank()) {
+                    return true;
+                }
+            }
+            if (hasMappedRequired) {
+                return false;
+            }
+        }
+
+        boolean hasMappedCore = false;
         for (int i = 0; i < coreHeaders.size(); i++) {
             String norm = coreHeaders.get(i);
             if (norm == null) continue;
 
             Integer col = columnMap.get(norm);
             if (col == null) continue;
+            hasMappedCore = true;
 
             Cell cell = row.getCell(col);
             String v = (cell == null) ? "" : fmt.formatCellValue(cell).trim();
@@ -363,8 +390,19 @@ public class ExcelMergeService {
                 return true; // 只要有一个非序号字段有值，就认为是数据行
             }
         }
+        if (hasMappedCore) {
+            return false;
+        }
+        for (int c = row.getFirstCellNum(); c < row.getLastCellNum(); c++) {
+            Cell cell = row.getCell(c);
+            String v = cell == null ? "" : fmt.formatCellValue(cell).trim();
+            if (!v.isBlank()) {
+                return true;
+            }
+        }
         return false;
     }
+
 
     private List<String> resolveCoreHeaders(TemplateDefinition template) {
         if (template == null) {
@@ -515,8 +553,6 @@ public class ExcelMergeService {
         int first = sheet.getFirstRowNum();
         int last = Math.min(sheet.getLastRowNum(), first + HEADER_SCAN_LIMIT);
 
-        int bestRow = -1;
-        int bestCount = 0;
         DataFormatter fmt = new DataFormatter();
 
         for (int r = first; r <= last; r++) {
@@ -530,21 +566,21 @@ public class ExcelMergeService {
                 continue;
             }
 
-            int count = 0;
+            List<String> rowHeaders = new ArrayList<>();
             for (int c = row.getFirstCellNum(); c < row.getLastCellNum(); c++) {
                 Cell cell = row.getCell(c);
                 String value = cell == null ? "" : normalizeHeader(fmt.formatCellValue(cell));
-                if (!value.isBlank() && templateHeaders.contains(value)) {
-                    count++;
+                if (!value.isBlank()) {
+                    rowHeaders.add(value);
                 }
             }
-            if (count > bestCount) {
-                bestCount = count;
-                bestRow = r;
+            if (isExactHeaderMatch(rowHeaders, templateHeaders)) {
+                return r;
             }
         }
-        return bestCount == 0 ? -1 : bestRow;
+        return -1;
     }
+
 
     private boolean isInstructionLikeRow(Row row, DataFormatter fmt) {
         if (row == null) return false;
@@ -710,8 +746,10 @@ public class ExcelMergeService {
     private boolean isDateString(String value) {
         String normalized = value.trim().replace('.', '-').replace('/', '-');
         List<DateTimeFormatter> formats = List.of(
+                DateTimeFormatter.ofPattern("yyyyMMdd"),
                 DateTimeFormatter.ofPattern("yyyy-M-d"),
-                DateTimeFormatter.ofPattern("yyyy-MM-dd")
+                DateTimeFormatter.ofPattern("yyyy-MM-dd"),
+                DateTimeFormatter.ofPattern("yyyy年M月d日")
         );
         for (DateTimeFormatter fmt : formats) {
             try {
@@ -791,7 +829,25 @@ public class ExcelMergeService {
         return false;
     }
 
-
+    private boolean isExactHeaderMatch(List<String> rowHeaders, List<String> templateHeaders) {
+        if (rowHeaders == null || templateHeaders == null) {
+            return false;
+        }
+        List<String> filteredRow = rowHeaders.stream()
+                .filter(v -> v != null && !v.isBlank())
+                .toList();
+        if (filteredRow.isEmpty() || templateHeaders.isEmpty()) {
+            return false;
+        }
+        if (filteredRow.size() != templateHeaders.size()) {
+            return false;
+        }
+        Set<String> rowSet = new LinkedHashSet<>(filteredRow);
+        if (rowSet.size() != filteredRow.size()) {
+            return false;
+        }
+        return filteredRow.equals(templateHeaders);
+    }
     private Sheet pickBestDataSheet(Workbook workbook) {
         DataFormatter fmt = new DataFormatter();
 
