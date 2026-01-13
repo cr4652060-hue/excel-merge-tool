@@ -22,6 +22,7 @@ public class ExcelMergeService {
     private static final int HEADER_SCAN_LIMIT = 30;
     private static final int TYPE_SAMPLE_LIMIT = 50;
     private static final int PREVIEW_LIMIT = 500;
+    private static final int INVALID_ROW_LIMIT = 30;
 
     private static final Pattern HEADER_TEXT_PATTERN = Pattern.compile(".*[A-Za-z\\u4e00-\\u9fff].*");
     private static final Pattern SERIAL_HEADER_PATTERN = Pattern.compile("^(序号|序|编号|行号|序列|no|No|NO)$");
@@ -31,7 +32,16 @@ public class ExcelMergeService {
     private static final Pattern INSTRUCTION_KEYWORDS = Pattern.compile(
             ".*(填写|说明|注意|示例|要求|口径|备注|提示|温馨提示|如实|以下|请按|请填写|填报|填表|规则|校验|检查).*"
     );
-
+    private static final List<String> KEY_FIELD_KEYWORDS = List.of(
+            "设备类型及名称",
+            "设备类型名称",
+            "设备类型",
+            "规格型号",
+            "设备序列号",
+            "设备序号",
+            "管理人",
+            "使用人"
+    );
     private final AtomicReference<TemplateDefinition> templateRef = new AtomicReference<>();
     private final AtomicReference<List<List<String>>> mergedRowsRef = new AtomicReference<>();
     private final List<TemplateRule> templateRules = loadTemplateRules();
@@ -139,22 +149,38 @@ public class ExcelMergeService {
                     }
                 }
 
-                int lastRow = sheet.getLastRowNum();
                 DataFormatter fmt = new DataFormatter();
                 List<String> coreHeaders = resolveCoreHeaders(template);
-                for (int r = headerRowIndex + 1; r <= lastRow; r++) {
+                Integer serialColumn = resolveSerialColumnIndex(template, columnMap);
+                List<Integer> keyColumns = resolveKeyColumns(template, columnMap);
+                int invalidStreak = 0;
+                for (int r = headerRowIndex + 1; r <= sheet.getLastRowNum(); r++) {
                     Row row = sheet.getRow(r);
-                    // ✅ 1) 跳过空行
-                    if (row == null) continue;
-
-                    // ✅ 2) 跳过筛选隐藏行（只合并“可见行”）
-                    if (isHiddenRow(row)) continue;
-
-                    // ✅ 3) 只有“真正填写了内容”的行才算数据行
-                    //     （只填序号、或者末尾空行，都直接跳过）
-                    if (!isMeaningfulDataRow(row, fmt, coreHeaders, template.requiredNormalizedHeaders(), columnMap)) {
+                    // ✅ 1) 处理空行
+                    if (row == null) {
+                        if (shouldStopByInvalidRow(++invalidStreak)) {
+                            break;
+                        }
                         continue;
                     }
+
+                    // ✅ 2) 跳过筛选隐藏行（只合并“可见行”）
+                    if (isHiddenRow(row)) {
+                        if (shouldStopByInvalidRow(++invalidStreak)) {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    // ✅ 3) 仅符合业务规则的行才算数据行
+                    if (!isBusinessDataRow(row, fmt, serialColumn, keyColumns,
+                            coreHeaders, template.requiredNormalizedHeaders(), columnMap)) {
+                        if (shouldStopByInvalidRow(++invalidStreak)) {
+                            break;
+                        }
+                        continue;
+                    }
+                    invalidStreak = 0;
                     List<String> values = new ArrayList<>();
                     for (int c = 0; c < template.normalizedHeaders().size(); c++) {
                         String norm = template.normalizedHeaders().get(c);
@@ -412,6 +438,116 @@ public class ExcelMergeService {
         return false;
     }
 
+    private boolean isBusinessDataRow(Row row,
+                                      DataFormatter fmt,
+                                      Integer serialColumn,
+                                      List<Integer> keyColumns,
+                                      List<String> coreHeaders,
+                                      Set<String> requiredHeaders,
+                                      Map<String, Integer> columnMap) {
+        if (row == null) {
+            return false;
+        }
+        if (serialColumn != null) {
+            Cell serialCell = row.getCell(serialColumn);
+            if (!isValidSerialCell(serialCell, fmt)) {
+                return false;
+            }
+            if (keyColumns != null && !keyColumns.isEmpty()) {
+                for (Integer col : keyColumns) {
+                    if (col == null) {
+                        continue;
+                    }
+                    Cell cell = row.getCell(col);
+                    String v = cell == null ? "" : fmt.formatCellValue(cell).trim();
+                    if (!v.isBlank()) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }
+        return isMeaningfulDataRow(row, fmt, coreHeaders, requiredHeaders, columnMap);
+    }
+
+    private boolean isValidSerialCell(Cell cell, DataFormatter fmt) {
+        if (cell == null) {
+            return false;
+        }
+        String value = fmt.formatCellValue(cell).trim();
+        if (value.isBlank()) {
+            return false;
+        }
+        String normalized = value.replace(",", "");
+        if (normalized.matches("\\d+")) {
+            return true;
+        }
+        CellType cellType = cell.getCellType() == CellType.FORMULA
+                ? cell.getCachedFormulaResultType()
+                : cell.getCellType();
+        if (cellType == CellType.NUMERIC && !DateUtil.isCellDateFormatted(cell)) {
+            double numeric = cell.getNumericCellValue();
+            return numeric == Math.floor(numeric);
+        }
+        return false;
+    }
+
+    private boolean shouldStopByInvalidRow(int invalidStreak) {
+        return invalidStreak >= INVALID_ROW_LIMIT;
+    }
+
+    private Integer resolveSerialColumnIndex(TemplateDefinition template, Map<String, Integer> columnMap) {
+        if (template != null) {
+            for (String header : template.normalizedHeaders()) {
+                if (isSerialHeader(header)) {
+                    Integer col = columnMap.get(header);
+                    if (col != null) {
+                        return col;
+                    }
+                }
+            }
+        }
+        for (Map.Entry<String, Integer> entry : columnMap.entrySet()) {
+            if (isSerialHeader(entry.getKey())) {
+                return entry.getValue();
+            }
+        }
+        return null;
+    }
+
+    private List<Integer> resolveKeyColumns(TemplateDefinition template, Map<String, Integer> columnMap) {
+        if (template == null || columnMap == null || columnMap.isEmpty()) {
+            return List.of();
+        }
+        LinkedHashSet<Integer> indexes = new LinkedHashSet<>();
+        for (String header : template.normalizedHeaders()) {
+            if (header == null || header.isBlank()) {
+                continue;
+            }
+            if (isSerialHeader(header)) {
+                continue;
+            }
+            if (isKeyFieldHeader(header)) {
+                Integer col = columnMap.get(header);
+                if (col != null) {
+                    indexes.add(col);
+                }
+            }
+        }
+        return new ArrayList<>(indexes);
+    }
+
+    private boolean isKeyFieldHeader(String normalizedHeader) {
+        if (normalizedHeader == null || normalizedHeader.isBlank()) {
+            return false;
+        }
+        for (String keyword : KEY_FIELD_KEYWORDS) {
+            if (normalizedHeader.contains(keyword)) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     private List<String> resolveCoreHeaders(TemplateDefinition template) {
         if (template == null) {
