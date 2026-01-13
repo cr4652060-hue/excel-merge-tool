@@ -23,6 +23,11 @@ public class ExcelMergeService {
     private static final int TYPE_SAMPLE_LIMIT = 50;
     private static final int PREVIEW_LIMIT = 500;
     private static final int INVALID_ROW_LIMIT = 30;
+    private static final int EDITABLE_SAMPLE_LIMIT = 200;
+    private static final double EDITABLE_FILL_RATE_THRESHOLD = 0.6;
+    private static final double STATIC_FILL_RATE_THRESHOLD = 0.9;
+    private static final double STATIC_VARIATION_THRESHOLD = 0.2;
+    private static final double EDITABLE_VARIATION_THRESHOLD = 0.5;
 
     private static final Pattern HEADER_TEXT_PATTERN = Pattern.compile(".*[A-Za-z\\u4e00-\\u9fff].*");
     private static final Pattern SERIAL_HEADER_PATTERN = Pattern.compile("^(序号|序|编号|行号|序列|no|No|NO)$");
@@ -85,11 +90,19 @@ public class ExcelMergeService {
 
             List<ColumnType> types = detectColumnTypes(sheet, headerRow + 1, columnIndexes);
             Set<String> requiredNormalizedHeaders = resolveRequiredHeaders(normalized);
+            Set<String> editableNormalizedHeaders = detectEditableColumns(
+                    sheet,
+                    headerRow + 1,
+                    columnIndexes,
+                    normalized,
+                    requiredNormalizedHeaders
+            );
             TemplateDefinition definition = new TemplateDefinition(
                     headers,
                     normalized,
                     types,
                     requiredNormalizedHeaders,
+                    editableNormalizedHeaders,
                     headerRow,
                     headerRow + 1
             );
@@ -150,15 +163,13 @@ public class ExcelMergeService {
                 }
 
                 DataFormatter fmt = new DataFormatter();
-                List<String> coreHeaders = resolveCoreHeaders(template);
-                Integer serialColumn = resolveSerialColumnIndex(template, columnMap);
-                List<Integer> keyColumns = resolveKeyColumns(template, columnMap);
-                int invalidStreak = 0;
+                List<Integer> editableColumns = resolveEditableColumnIndexes(template, columnMap);
+                int emptyEditableStreak = 0;
                 for (int r = headerRowIndex + 1; r <= sheet.getLastRowNum(); r++) {
                     Row row = sheet.getRow(r);
                     // ✅ 1) 处理空行
                     if (row == null) {
-                        if (shouldStopByInvalidRow(++invalidStreak)) {
+                        if (shouldStopByInvalidRow(++emptyEditableStreak)) {
                             break;
                         }
                         continue;
@@ -166,21 +177,20 @@ public class ExcelMergeService {
 
                     // ✅ 2) 跳过筛选隐藏行（只合并“可见行”）
                     if (isHiddenRow(row)) {
-                        if (shouldStopByInvalidRow(++invalidStreak)) {
+                        if (shouldStopByInvalidRow(++emptyEditableStreak)) {
                             break;
                         }
                         continue;
                     }
 
-                    // ✅ 3) 仅符合业务规则的行才算数据行
-                    if (!isBusinessDataRow(row, fmt, serialColumn, keyColumns,
-                            coreHeaders, template.requiredNormalizedHeaders(), columnMap)) {
-                        if (shouldStopByInvalidRow(++invalidStreak)) {
+                    // ✅ 3) 仅当可编辑列有值时才算数据行（B 版保守模式）
+                    if (!hasEditableValue(row, fmt, editableColumns)) {
+                        if (shouldStopByInvalidRow(++emptyEditableStreak)) {
                             break;
                         }
                         continue;
                     }
-                    invalidStreak = 0;
+                    emptyEditableStreak = 0;
                     List<String> values = new ArrayList<>();
                     for (int c = 0; c < template.normalizedHeaders().size(); c++) {
                         String norm = template.normalizedHeaders().get(c);
@@ -469,7 +479,22 @@ public class ExcelMergeService {
         }
         return isMeaningfulDataRow(row, fmt, coreHeaders, requiredHeaders, columnMap);
     }
-
+    private boolean hasEditableValue(Row row, DataFormatter fmt, List<Integer> editableColumns) {
+        if (row == null || editableColumns == null || editableColumns.isEmpty()) {
+            return false;
+        }
+        for (Integer col : editableColumns) {
+            if (col == null) {
+                continue;
+            }
+            Cell cell = row.getCell(col);
+            String value = cell == null ? "" : fmt.formatCellValue(cell).trim();
+            if (!value.isBlank()) {
+                return true;
+            }
+        }
+        return false;
+    }
     private boolean isValidSerialCell(Cell cell, DataFormatter fmt) {
         if (cell == null) {
             return false;
@@ -495,7 +520,37 @@ public class ExcelMergeService {
     private boolean shouldStopByInvalidRow(int invalidStreak) {
         return invalidStreak >= INVALID_ROW_LIMIT;
     }
-
+    private List<Integer> resolveEditableColumnIndexes(TemplateDefinition template, Map<String, Integer> columnMap) {
+        if (template == null || columnMap == null || columnMap.isEmpty()) {
+            return List.of();
+        }
+        Set<String> editableHeaders = template.editableNormalizedHeaders();
+        if (editableHeaders == null || editableHeaders.isEmpty()) {
+            editableHeaders = new LinkedHashSet<>(template.normalizedHeaders());
+        }
+        LinkedHashSet<Integer> indexes = new LinkedHashSet<>();
+        for (String header : editableHeaders) {
+            if (header == null || header.isBlank()) {
+                continue;
+            }
+            Integer col = columnMap.get(header);
+            if (col != null) {
+                indexes.add(col);
+            }
+        }
+        if (indexes.isEmpty()) {
+            for (String header : template.normalizedHeaders()) {
+                if (isSerialHeader(header)) {
+                    continue;
+                }
+                Integer col = columnMap.get(header);
+                if (col != null) {
+                    indexes.add(col);
+                }
+            }
+        }
+        return new ArrayList<>(indexes);
+    }
     private Integer resolveSerialColumnIndex(TemplateDefinition template, Map<String, Integer> columnMap) {
         if (template != null) {
             for (String header : template.normalizedHeaders()) {
@@ -825,6 +880,73 @@ public class ExcelMergeService {
             types.add(detectColumnTypeForColumn(sheet, dataStartRow, col));
         }
         return types;
+    }
+    private Set<String> detectEditableColumns(Sheet sheet,
+                                              int dataStartRow,
+                                              List<Integer> columnIndexes,
+                                              List<String> normalizedHeaders,
+                                              Set<String> requiredHeaders) {
+        if (sheet == null || columnIndexes == null || normalizedHeaders == null) {
+            return Set.of();
+        }
+        int lastRow = Math.min(sheet.getLastRowNum(), dataStartRow + EDITABLE_SAMPLE_LIMIT);
+        DataFormatter fmt = new DataFormatter();
+        LinkedHashSet<String> editable = new LinkedHashSet<>();
+
+        for (int i = 0; i < columnIndexes.size(); i++) {
+            Integer colIndex = columnIndexes.get(i);
+            if (colIndex == null || i >= normalizedHeaders.size()) {
+                continue;
+            }
+            String header = normalizedHeaders.get(i);
+            if (isSerialHeader(header)) {
+                continue;
+            }
+            if (requiredHeaders != null && requiredHeaders.contains(header)) {
+                editable.add(header);
+                continue;
+            }
+            int total = 0;
+            int nonEmpty = 0;
+            Set<String> distinct = new HashSet<>();
+            for (int r = dataStartRow; r <= lastRow; r++) {
+                Row row = sheet.getRow(r);
+                if (row == null) {
+                    continue;
+                }
+                total++;
+                Cell cell = row.getCell(colIndex);
+                String value = cell == null ? "" : fmt.formatCellValue(cell).trim();
+                if (value.isBlank()) {
+                    continue;
+                }
+                nonEmpty++;
+                distinct.add(value);
+            }
+            if (total == 0) {
+                continue;
+            }
+            double fillRate = nonEmpty / (double) total;
+            double variation = nonEmpty == 0 ? 0 : distinct.size() / (double) nonEmpty;
+            boolean isEditable = fillRate <= EDITABLE_FILL_RATE_THRESHOLD
+                    || variation >= EDITABLE_VARIATION_THRESHOLD;
+            boolean isStatic = fillRate >= STATIC_FILL_RATE_THRESHOLD
+                    && variation <= STATIC_VARIATION_THRESHOLD;
+
+            if (isEditable && !isStatic) {
+                editable.add(header);
+            }
+        }
+
+        if (editable.isEmpty()) {
+            for (String header : normalizedHeaders) {
+                if (header == null || header.isBlank() || isSerialHeader(header)) {
+                    continue;
+                }
+                editable.add(header);
+            }
+        }
+        return editable;
     }
 
     private ColumnType detectColumnTypeForColumn(Sheet sheet, int dataStartRow, int columnIndex) {

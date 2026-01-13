@@ -8,6 +8,7 @@ public record TemplateDefinition(
         List<String> normalizedHeaders,
         List<ColumnType> columnTypes,
         Set<String> requiredNormalizedHeaders,
+        Set<String> editableNormalizedHeaders,
         int headerRowIndex,
         int dataStartRow
 ) {
