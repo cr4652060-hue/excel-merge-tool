@@ -1,13 +1,16 @@
 package com.example.excelmerge.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 import org.apache.poi.ss.util.CellRangeAddress;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
@@ -29,6 +32,7 @@ public class ExcelMergeService {
 
     private final AtomicReference<TemplateDefinition> templateRef = new AtomicReference<>();
     private final AtomicReference<List<List<String>>> mergedRowsRef = new AtomicReference<>();
+    private final List<TemplateRule> templateRules = loadTemplateRules();
 
     public TemplateInfo analyzeTemplate(MultipartFile file) {
         try (Workbook workbook = WorkbookFactory.create(file.getInputStream())) {
@@ -68,10 +72,12 @@ public class ExcelMergeService {
             }
 
             List<ColumnType> types = detectColumnTypes(sheet, headerRow + 1, columnIndexes);
+            Set<String> requiredNormalizedHeaders = resolveRequiredHeaders(normalized);
             TemplateDefinition definition = new TemplateDefinition(
                     headers,
                     normalized,
                     types,
+                    requiredNormalizedHeaders,
                     headerRow,
                     headerRow + 1
             );
@@ -159,7 +165,7 @@ public class ExcelMergeService {
 // =========================
                         if (value.isBlank()) {
                             if (validationLevel == ValidationLevel.STRICT
-                                    && isRequiredHeader(template.headers().get(c))) {
+                                    && template.requiredNormalizedHeaders().contains(norm)) {
 
                                 issues.add(new MergeIssue(
                                         file.getOriginalFilename(),
@@ -262,19 +268,65 @@ public class ExcelMergeService {
 
 //private final ValidationLevel validationLevel = ValidationLevel.LENIENT;
 
-    private boolean isRequiredHeader(String header) {
-        if (header == null) return false;
-        String h = header.replaceAll("\\s+", "");
+    private List<TemplateRule> loadTemplateRules() {
+        ClassPathResource resource = new ClassPathResource("template-config.json");
+        if (!resource.exists()) {
+            return List.of();
+        }
+        ObjectMapper mapper = new ObjectMapper();
+        try (InputStream input = resource.getInputStream()) {
+            TemplateConfig config = mapper.readValue(input, TemplateConfig.class);
+            if (config == null || config.templates() == null) {
+                return List.of();
+            }
+            return config.templates().stream()
+                    .filter(Objects::nonNull)
+                    .toList();
+        } catch (IOException e) {
+            throw new IllegalStateException("模板配置读取失败：" + e.getMessage(), e);
+        }
+    }
 
-        // 金额、备注：允许为空
-        if (h.contains("金额") || h.contains("备注")) return false;
+    private Set<String> resolveRequiredHeaders(List<String> normalizedHeaders) {
+        if (templateRules.isEmpty() || normalizedHeaders == null || normalizedHeaders.isEmpty()) {
+            return Set.of();
+        }
+        Set<String> availableHeaders = new HashSet<>(normalizedHeaders);
+        TemplateRule bestMatch = null;
+        int bestScore = 0;
+        for (TemplateRule rule : templateRules) {
+            List<String> matchHeaders = normalizeHeaders(rule.matchHeaders());
+            if (matchHeaders.isEmpty()) {
+                continue;
+            }
+            if (availableHeaders.containsAll(matchHeaders)) {
+                int score = matchHeaders.size();
+                if (score > bestScore) {
+                    bestMatch = rule;
+                    bestScore = score;
+                }
+            }
+        }
+        if (bestMatch == null) {
+            return Set.of();
+        }
+        return normalizeHeaders(bestMatch.requiredHeaders()).stream()
+                .filter(availableHeaders::contains)
+                .collect(LinkedHashSet::new, Set::add, Set::addAll);
+    }
 
-        // 必填项（按你们网点表结构）
-        return h.contains("序号")
-                || h.contains("单位") || h.contains("网点")
-                || h.contains("账号") || h.contains("卡号")
-                || h.contains("姓名")
-                || h.contains("账户类型") || h.contains("账户类别");
+    private List<String> normalizeHeaders(List<String> headers) {
+        if (headers == null || headers.isEmpty()) {
+            return List.of();
+        }
+        List<String> normalized = new ArrayList<>();
+        for (String header : headers) {
+            String value = normalizeHeader(header);
+            if (!value.isBlank()) {
+                normalized.add(value);
+            }
+        }
+        return normalized;
     }
 
     // ① 跳过被筛选隐藏的行（AutoFilter / 手动隐藏）

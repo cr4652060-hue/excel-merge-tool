@@ -1,0 +1,19 @@
+{
+  "templates": [
+    {
+      "name": "模板A",
+      "matchHeaders": ["账号", "姓名", "金额"],
+      "requiredHeaders": ["账号", "姓名"]
+    },
+    {
+      "name": "模板B",
+      "matchHeaders": ["序号", "金额", "开户行"],
+      "requiredHeaders": ["序号", "金额"]
+    },
+    {
+      "name": "模板C",
+      "matchHeaders": ["姓名", "账户类型", "证件号"],
+      "requiredHeaders": ["姓名", "账户类型"]
+    }
+  ]
+}
