@@ -4,6 +4,7 @@ import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
+import org.apache.poi.ss.util.CellRangeAddress;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -17,14 +18,22 @@ import java.util.regex.Pattern;
 public class ExcelMergeService {
     private static final int HEADER_SCAN_LIMIT = 30;
     private static final int TYPE_SAMPLE_LIMIT = 50;
-    private static final int PREVIEW_LIMIT = 50;
+    private static final int PREVIEW_LIMIT = 500;
+
     private static final Pattern HEADER_TEXT_PATTERN = Pattern.compile(".*[A-Za-z\\u4e00-\\u9fff].*");
+
+    // ✅ 新增：说明行关键词
+    private static final Pattern INSTRUCTION_KEYWORDS = Pattern.compile(
+            ".*(填写|说明|注意|示例|要求|口径|备注|提示|温馨提示|如实|以下|请按|请填写|填报|填表|规则|校验|检查).*"
+    );
+
     private final AtomicReference<TemplateDefinition> templateRef = new AtomicReference<>();
     private final AtomicReference<List<List<String>>> mergedRowsRef = new AtomicReference<>();
 
     public TemplateInfo analyzeTemplate(MultipartFile file) {
         try (Workbook workbook = WorkbookFactory.create(file.getInputStream())) {
-            Sheet sheet = workbook.getSheetAt(0);
+            Sheet sheet = pickBestDataSheet(workbook);
+
             int headerRow = findHeaderRowByDensity(sheet);
             if (headerRow < 0) {
                 headerRow = findFirstNonEmptyRow(sheet);
@@ -93,7 +102,9 @@ public class ExcelMergeService {
                 continue;
             }
             try (Workbook workbook = WorkbookFactory.create(file.getInputStream())) {
-                Sheet sheet = workbook.getSheetAt(0);
+                Sheet sheet = pickBestDataSheet(workbook);
+
+
                 int headerRowIndex = findHeaderRowByMatch(sheet, template.normalizedHeaders());
                 if (headerRowIndex < 0) {
                     issues.add(new MergeIssue(file.getOriginalFilename(), sheet.getSheetName(), null, null,
@@ -116,7 +127,15 @@ public class ExcelMergeService {
                 DataFormatter fmt = new DataFormatter();
                 for (int r = headerRowIndex + 1; r <= lastRow; r++) {
                     Row row = sheet.getRow(r);
-                    if (isRowBlank(row, fmt)) {
+                    // ✅ 1) 跳过空行
+                    if (row == null) continue;
+
+                    // ✅ 2) 跳过筛选隐藏行（只合并“可见行”）
+                    if (isHiddenRow(row)) continue;
+
+                    // ✅ 3) 只有“真正填写了内容”的行才算数据行
+                    //     （只填序号、或者末尾空行，都直接跳过）
+                    if (!isMeaningfulDataRow(row, fmt, template.normalizedHeaders(), columnMap)) {
                         continue;
                     }
                     List<String> values = new ArrayList<>();
@@ -135,16 +154,38 @@ public class ExcelMergeService {
                         if (missingColumns.contains(norm)) {
                             continue;
                         }
+                        // =========================
+// 按校验等级处理空值
+// =========================
                         if (value.isBlank()) {
-                            issues.add(new MergeIssue(file.getOriginalFilename(), sheet.getSheetName(),
-                                    r + 1, template.headers().get(c), "单元格为空"));
+                            if (validationLevel == ValidationLevel.STRICT
+                                    && isRequiredHeader(template.headers().get(c))) {
+
+                                issues.add(new MergeIssue(
+                                        file.getOriginalFilename(),
+                                        sheet.getSheetName(),
+                                        r + 1,
+                                        template.headers().get(c),
+                                        "必填项为空"
+                                ));
+                            }
+                            // 不管严格还是宽松，空值都不再做类型校验
                             continue;
                         }
 
+// =========================
+// 只有“有值”时才做格式校验
+// =========================
                         if (!matchesExpectedType(cell, value, expectedType)) {
-                            issues.add(new MergeIssue(file.getOriginalFilename(), sheet.getSheetName(),
-                                    r + 1, template.headers().get(c), "格式与模板不一致"));
+                            issues.add(new MergeIssue(
+                                    file.getOriginalFilename(),
+                                    sheet.getSheetName(),
+                                    r + 1,
+                                    template.headers().get(c),
+                                    "格式与模板不一致"
+                            ));
                         }
+
                     }
                     mergedRows.add(values);
                 }
@@ -193,12 +234,95 @@ public class ExcelMergeService {
         }
     }
 
+    public class ExcelTemplateDefinition {
+        private List<String> requiredColumns;  // 必填字段
+
+        public List<String> getRequiredColumns() {
+            return requiredColumns;
+        }
+
+        public void setRequiredColumns(List<String> requiredColumns) {
+            this.requiredColumns = requiredColumns;
+        }
+    }
+
+
+
+
+    // =========================
+// 校验等级开关（默认 STRICT）
+// =========================
+    private enum ValidationLevel {
+        STRICT,   // 严格：必填列为空 -> 报错
+        LENIENT   // 宽松：空值不报错
+    }
+
+    // 👉 要的默认值：严格
+    private final ValidationLevel validationLevel = ValidationLevel.STRICT;
+
+//private final ValidationLevel validationLevel = ValidationLevel.LENIENT;
+
+    private boolean isRequiredHeader(String header) {
+        if (header == null) return false;
+        String h = header.replaceAll("\\s+", "");
+
+        // 金额、备注：允许为空
+        if (h.contains("金额") || h.contains("备注")) return false;
+
+        // 必填项（按你们网点表结构）
+        return h.contains("序号")
+                || h.contains("单位") || h.contains("网点")
+                || h.contains("账号") || h.contains("卡号")
+                || h.contains("姓名")
+                || h.contains("账户类型") || h.contains("账户类别");
+    }
+
+    // ① 跳过被筛选隐藏的行（AutoFilter / 手动隐藏）
+    private boolean isHiddenRow(Row row) {
+        return row != null && row.getZeroHeight(); // 筛选隐藏/设置行高为0 时为 true
+    }
+
+    // ② 判断这一行是不是“真实数据行”
+//    只填了序号不算；只要【除序号外】任意列有值，才算数据行
+    private boolean isMeaningfulDataRow(Row row, DataFormatter fmt,
+                                        List<String> normalizedHeaders,
+                                        Map<String, Integer> columnMap) {
+        if (row == null) return false;
+
+        for (int i = 0; i < normalizedHeaders.size(); i++) {
+            String norm = normalizedHeaders.get(i);
+            if (norm == null) continue;
+
+            // 序号不算数据
+            if (norm.contains("序号")) continue;
+
+            Integer col = columnMap.get(norm);
+            if (col == null) continue;
+
+            Cell cell = row.getCell(col);
+            String v = (cell == null) ? "" : fmt.formatCellValue(cell).trim();
+            if (!v.isBlank()) {
+                return true; // 只要有一个非序号字段有值，就认为是数据行
+            }
+        }
+        return false;
+    }
+
+
+
+    // =========================
+    // ✅ 表头定位：改进版
+    // =========================
+
     private int findHeaderRowByDensity(Sheet sheet) {
         int first = sheet.getFirstRowNum();
         int last = Math.min(sheet.getLastRowNum(), first + HEADER_SCAN_LIMIT);
+
         int bestRow = -1;
         int bestTextCount = 0;
         int bestNonEmptyCount = 0;
+        int instructionRowFallback = -1;
+
         DataFormatter fmt = new DataFormatter();
 
         for (int r = first; r <= last; r++) {
@@ -206,36 +330,72 @@ public class ExcelMergeService {
             if (row == null) {
                 continue;
             }
+
             int nonEmptyCount = 0;
             int textCount = 0;
+            int firstNonEmptyCol = -1;
+            String mainText = null;
+
             for (int c = row.getFirstCellNum(); c < row.getLastCellNum(); c++) {
                 Cell cell = row.getCell(c);
                 String value = cell == null ? "" : fmt.formatCellValue(cell).trim();
                 if (value.isBlank()) {
                     continue;
                 }
+                if (firstNonEmptyCol < 0) {
+                    firstNonEmptyCol = c;
+                    mainText = value;
+                }
                 nonEmptyCount++;
                 if (isHeaderTextCell(cell, value)) {
                     textCount++;
                 }
             }
+
             if (textCount == 0 && nonEmptyCount == 0) {
                 continue;
             }
+
+            // 合并单元格标题说明行
+            if (isInstructionRow(sheet, r, firstNonEmptyCol, nonEmptyCount)) {
+                if (instructionRowFallback < 0) {
+                    instructionRowFallback = r;
+                }
+                continue;
+            }
+
+            // 非合并单元格说明行：只有一个有效格 + 命中关键词
+            if (nonEmptyCount == 1 && looksLikeInstructionText(mainText)) {
+                // 优先尝试下一行
+                int next = r + 1;
+                if (next <= sheet.getLastRowNum()) {
+                    Row nextRow = sheet.getRow(next);
+                    if (isLikelyHeaderRow(nextRow, fmt)) {
+                        return next;
+                    }
+                }
+                if (instructionRowFallback < 0) {
+                    instructionRowFallback = r;
+                }
+                continue;
+            }
+
             if (textCount > bestTextCount || (textCount == bestTextCount && nonEmptyCount > bestNonEmptyCount)) {
                 bestTextCount = textCount;
                 bestNonEmptyCount = nonEmptyCount;
                 bestRow = r;
             }
         }
-        if (bestRow < 0) {
-            return -1;
+
+        if (bestRow >= 0) {
+            if (bestTextCount == 0) {
+                return bestNonEmptyCount == 0 ? -1 : bestRow;
+            }
+            return bestRow;
         }
-        if (bestTextCount == 0) {
-            return bestNonEmptyCount == 0 ? -1 : bestRow;
-        }
-        return bestRow;
+        return instructionRowFallback;
     }
+
     private int findFirstNonEmptyRow(Sheet sheet) {
         int first = sheet.getFirstRowNum();
         int last = Math.min(sheet.getLastRowNum(), first + HEADER_SCAN_LIMIT);
@@ -260,6 +420,7 @@ public class ExcelMergeService {
     private int findHeaderRowByMatch(Sheet sheet, List<String> templateHeaders) {
         int first = sheet.getFirstRowNum();
         int last = Math.min(sheet.getLastRowNum(), first + HEADER_SCAN_LIMIT);
+
         int bestRow = -1;
         int bestCount = 0;
         DataFormatter fmt = new DataFormatter();
@@ -269,6 +430,12 @@ public class ExcelMergeService {
             if (row == null) {
                 continue;
             }
+
+            // ✅ 跳过说明行
+            if (isInstructionLikeRow(row, fmt)) {
+                continue;
+            }
+
             int count = 0;
             for (int c = row.getFirstCellNum(); c < row.getLastCellNum(); c++) {
                 Cell cell = row.getCell(c);
@@ -284,6 +451,56 @@ public class ExcelMergeService {
         }
         return bestCount == 0 ? -1 : bestRow;
     }
+
+    private boolean isInstructionLikeRow(Row row, DataFormatter fmt) {
+        if (row == null) return false;
+
+        int nonEmpty = 0;
+        String main = null;
+
+        for (int c = row.getFirstCellNum(); c < row.getLastCellNum(); c++) {
+            Cell cell = row.getCell(c);
+            String v = cell == null ? "" : fmt.formatCellValue(cell).trim();
+            if (v.isBlank()) continue;
+            nonEmpty++;
+            if (main == null) main = v;
+        }
+        return nonEmpty == 1 && looksLikeInstructionText(main);
+    }
+
+    private boolean isLikelyHeaderRow(Row row, DataFormatter fmt) {
+        if (row == null) return false;
+
+        int nonEmpty = 0;
+        int text = 0;
+
+        for (int c = row.getFirstCellNum(); c < row.getLastCellNum(); c++) {
+            Cell cell = row.getCell(c);
+            String v = cell == null ? "" : fmt.formatCellValue(cell).trim();
+            if (v.isBlank()) continue;
+
+            if (looksLikeInstructionText(v)) return false;
+
+            nonEmpty++;
+            if (isHeaderTextCell(cell, v)) {
+                text++;
+            }
+        }
+
+        if (nonEmpty < 2) return false;
+        return text >= Math.max(2, (int) Math.ceil(nonEmpty * 0.6));
+    }
+
+    private boolean looksLikeInstructionText(String v) {
+        if (v == null) return false;
+        String s = v.trim();
+        if (s.isBlank()) return false;
+        return INSTRUCTION_KEYWORDS.matcher(s).matches();
+    }
+
+    // =========================
+    // 原有逻辑保持不动
+    // =========================
 
     private Map<String, Integer> buildColumnMap(Row headerRow) {
         Map<String, Integer> map = new LinkedHashMap<>();
@@ -437,4 +654,65 @@ public class ExcelMergeService {
         }
         return HEADER_TEXT_PATTERN.matcher(trimmed).matches();
     }
+
+    private boolean isInstructionRow(Sheet sheet, int rowIndex, int firstNonEmptyCol, int nonEmptyCount) {
+        if (nonEmptyCount != 1 || firstNonEmptyCol < 0) {
+            return false;
+        }
+        int mergedCount = sheet.getNumMergedRegions();
+        if (mergedCount == 0) {
+            return false;
+        }
+        for (int i = 0; i < mergedCount; i++) {
+            CellRangeAddress region = sheet.getMergedRegion(i);
+            if (region.getFirstRow() <= rowIndex && region.getLastRow() >= rowIndex
+                    && region.getFirstColumn() <= firstNonEmptyCol && region.getLastColumn() >= firstNonEmptyCol) {
+                return region.getLastColumn() > region.getFirstColumn();
+            }
+        }
+        return false;
+    }
+
+
+    private Sheet pickBestDataSheet(Workbook workbook) {
+        DataFormatter fmt = new DataFormatter();
+
+        Sheet best = null;
+        int bestScore = -1;
+
+        for (int i = 0; i < workbook.getNumberOfSheets(); i++) {
+            Sheet sheet = workbook.getSheetAt(i);
+            if (sheet == null) continue;
+
+            int score = 0;
+            int maxRow = Math.min(sheet.getLastRowNum(), 80); // 只看前80行即可
+            for (int r = sheet.getFirstRowNum(); r <= maxRow; r++) {
+                Row row = sheet.getRow(r);
+                if (row == null) continue;
+
+                // 只看前50列防止超宽表浪费
+                short firstCell = row.getFirstCellNum();
+                short lastCell = row.getLastCellNum();
+                if (firstCell < 0 || lastCell < 0) continue;
+
+                int endCol = Math.min(lastCell, (short) (firstCell + 50));
+                for (int c = firstCell; c < endCol; c++) {
+                    Cell cell = row.getCell(c);
+                    String v = cell == null ? "" : fmt.formatCellValue(cell).trim();
+                    if (!v.isBlank()) score++;
+                }
+            }
+
+            // 至少要有一点内容才算数据sheet
+            if (score > bestScore) {
+                bestScore = score;
+                best = sheet;
+            }
+        }
+
+        // 兜底：全都空就返回第一个
+        return best != null ? best : workbook.getSheetAt(0);
+    }
+
+
 }
