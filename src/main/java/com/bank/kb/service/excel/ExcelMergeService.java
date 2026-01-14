@@ -18,6 +18,7 @@ import java.util.regex.Pattern;
 
 @Service
 public class ExcelMergeService {
+    private static final int INVALID_ROW_LIMIT = 30;
     private static final int HEADER_SCAN_LIMIT = 30;
     private static final int TYPE_SAMPLE_LIMIT = 50;
     private static final int PREVIEW_LIMIT = 500;
@@ -126,19 +127,34 @@ public class ExcelMergeService {
 
                 int lastRow = sheet.getLastRowNum();
                 DataFormatter fmt = new DataFormatter();
+                List<Integer> editableColumns = resolveEditableColumnIndexes(template, columnMap);
+                int emptyEditableStreak = 0;
                 for (int r = headerRowIndex + 1; r <= lastRow; r++) {
                     Row row = sheet.getRow(r);
                     // ✅ 1) 跳过空行
-                    if (row == null) continue;
-
-                    // ✅ 2) 跳过筛选隐藏行（只合并“可见行”）
-                    if (isHiddenRow(row)) continue;
-
-                    // ✅ 3) 只有“真正填写了内容”的行才算数据行
-                    //     （只填序号、或者末尾空行，都直接跳过）
-                    if (!isMeaningfulDataRow(row, fmt, template.normalizedHeaders(), columnMap)) {
+                    if (row == null) {
+                        if (shouldStopByInvalidRow(++emptyEditableStreak)) {
+                            break;
+                        }
                         continue;
                     }
+
+                    // ✅ 2) 跳过筛选隐藏行（只合并“可见行”）
+                    if (isHiddenRow(row)) {
+                        if (shouldStopByInvalidRow(++emptyEditableStreak)) {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    // ✅ 3) 所有可编辑列都为空 -> 不是数据行
+                    if (!hasEditableValue(row, fmt, editableColumns)) {
+                        if (shouldStopByInvalidRow(++emptyEditableStreak)) {
+                            break;
+                        }
+                        continue;
+                    }
+                    emptyEditableStreak = 0;
                     List<String> values = new ArrayList<>();
                     for (int c = 0; c < template.normalizedHeaders().size(); c++) {
                         String norm = template.normalizedHeaders().get(c);
@@ -274,30 +290,54 @@ public class ExcelMergeService {
         return row != null && row.getZeroHeight(); // 筛选隐藏/设置行高为0 时为 true
     }
 
-    // ② 判断这一行是不是“真实数据行”
-//    只填了序号不算；只要【除序号外】任意列有值，才算数据行
-    private boolean isMeaningfulDataRow(Row row, DataFormatter fmt,
-                                        List<String> normalizedHeaders,
-                                        Map<String, Integer> columnMap) {
-        if (row == null) return false;
-
-        for (int i = 0; i < normalizedHeaders.size(); i++) {
-            String norm = normalizedHeaders.get(i);
-            if (norm == null) continue;
-
-            if (isIgnorableForRowDetection(norm)) continue;
-
-
-            Integer col = columnMap.get(norm);
-            if (col == null) continue;
+    private boolean hasEditableValue(Row row, DataFormatter fmt, List<Integer> editableColumns) {
+        if (row == null || editableColumns == null || editableColumns.isEmpty()) {
+            return false;
+        }
+        for (Integer col : editableColumns) {
+            if (col == null) {
+                continue;
+            }
 
             Cell cell = row.getCell(col);
-            String v = (cell == null) ? "" : fmt.formatCellValue(cell).trim();
-            if (!v.isBlank()) {
-                return true; // 只要有一个非序号字段有值，就认为是数据行
+            String value = cell == null ? "" : fmt.formatCellValue(cell).trim();
+            if (!value.isBlank()) {
+                return true;
             }
         }
         return false;
+    }
+    private boolean shouldStopByInvalidRow(int invalidStreak) {
+        return invalidStreak >= INVALID_ROW_LIMIT;
+    }
+
+    private List<Integer> resolveEditableColumnIndexes(ExcelTemplateDefinition template,
+                                                       Map<String, Integer> columnMap) {
+        if (template == null || columnMap == null || columnMap.isEmpty()) {
+            return List.of();
+        }
+        LinkedHashSet<Integer> indexes = new LinkedHashSet<>();
+        for (String header : template.normalizedHeaders()) {
+            if (header == null || header.isBlank()) {
+                continue;
+            }
+            if (isIgnorableForRowDetection(header)) {
+                continue;
+            }
+            Integer col = columnMap.get(header);
+            if (col != null) {
+                indexes.add(col);
+            }
+        }
+        if (indexes.isEmpty()) {
+            for (String header : template.normalizedHeaders()) {
+                Integer col = columnMap.get(header);
+                if (col != null) {
+                    indexes.add(col);
+                }
+            }
+        }
+        return new ArrayList<>(indexes);
     }
 
     private boolean isSerialHeader(String normalizedHeader) {
