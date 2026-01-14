@@ -199,8 +199,19 @@ public class ExcelMergeService {
                 DataFormatter fmt = new DataFormatter();
                 List<Integer> editableColumns = resolveEditableColumnIndexes(template, columnMap);
                 KeyColumnInfo keyColumnInfo = resolveKeyColumnInfo(template, columnMap);
+                int firstDataRow = findFirstDataRow(sheet, headerRowIndex + 1, fmt, keyColumnInfo, editableColumns);
+
+// ✅ 用“从底往上找最后真实数据行”替代原 findLastDataRow
+                int lastDataRow = findLastRealDataRow(sheet, firstDataRow, fmt, keyColumnInfo, editableColumns);
+
+                if (firstDataRow < 0 || lastDataRow < 0 || lastDataRow < firstDataRow) {
+                    continue;
+                }
+                if (firstDataRow < 0 || lastDataRow < 0) {
+                    continue;
+                }
                 int emptyEditableStreak = 0;
-                for (int r = headerRowIndex + 1; r <= sheet.getLastRowNum(); r++) {
+                for (int r = firstDataRow; r <= lastDataRow; r++) {
                     Row row = sheet.getRow(r);
                     // ✅ 1) 处理空行
                     if (row == null) {
@@ -292,6 +303,73 @@ public class ExcelMergeService {
         mergedRowsRef.set(mergedRows);
         List<List<String>> preview = mergedRows.subList(0, Math.min(PREVIEW_LIMIT, mergedRows.size()));
         return new MergeResult(template.headers(), preview, mergedRows.size(), issues);
+    }
+    /**
+     * ✅ 从底往上找“最后一条真实数据行”
+     * 规则：
+     * 1) 不能是隐藏行
+     * 2) 不能是合计行
+     * 3) 必须通过你已有的关键列判定 isDataRowByKeyColumns
+     * 4) 且：必须至少有一个“有效编辑值”（排除空值、排除固定默认值比如 C）
+     */
+    private int findLastRealDataRow(
+            Sheet sheet,
+            int firstDataRow,
+            DataFormatter fmt,
+            KeyColumnInfo keyColumnInfo,
+            List<Integer> editableColumns
+    ) {
+        if (firstDataRow < 0) return -1;
+
+        int last = sheet.getLastRowNum();
+        for (int r = last; r >= firstDataRow; r--) {
+            Row row = sheet.getRow(r);
+            if (row == null) continue;
+            if (isHiddenRow(row)) continue;
+
+            // 合计行直接停止（有些表在底部有“合计/总计”）
+            if (isTotalRow(row, fmt)) {
+                continue;
+            }
+
+            // 必须先满足“关键列命中”
+            if (!isDataRowByKeyColumns(row, fmt, keyColumnInfo, editableColumns)) {
+                continue;
+            }
+
+            // 再满足：这一行确实有“有效编辑值”（否则很多空行会被默认值 C 误判）
+            if (hasAnyMeaningfulEditableValue(row, fmt, editableColumns)) {
+                return r;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * ✅ 判断一行是否存在“有意义的编辑值”
+     * - 空字符串不算
+     * - 固定默认值不算（比如账户类型整列默认 C）
+     * 你后面遇到别的固定值，也可以继续往 fixedValues 里加。
+     */
+    private boolean hasAnyMeaningfulEditableValue(Row row, DataFormatter fmt, List<Integer> editableColumns) {
+        if (editableColumns == null || editableColumns.isEmpty()) return false;
+
+        // 常见的“模板固定默认值”，这些不能算“有意义”
+        // 账户类型经常默认 C，所以必须排除，否则空行也会被当数据
+        Set<String> fixedValues = new HashSet<>(Arrays.asList("C", "c"));
+
+        for (Integer col : editableColumns) {
+            if (col == null) continue;
+            Cell cell = row.getCell(col);
+            if (cell == null) continue;
+
+            String v = fmt.formatCellValue(cell).trim();
+            if (v.isBlank()) continue;
+            if (fixedValues.contains(v)) continue;
+
+            return true;
+        }
+        return false;
     }
 
     public byte[] exportMerged() {
@@ -558,6 +636,48 @@ public class ExcelMergeService {
     private boolean shouldStopByInvalidRow(int invalidStreak) {
         return invalidStreak >= INVALID_ROW_LIMIT;
     }
+
+    private int findFirstDataRow(Sheet sheet,
+                                 int startRow,
+                                 DataFormatter fmt,
+                                 KeyColumnInfo keyColumnInfo,
+                                 List<Integer> editableColumns) {
+        if (sheet == null) {
+            return -1;
+        }
+        int last = sheet.getLastRowNum();
+        for (int r = startRow; r <= last; r++) {
+            Row row = sheet.getRow(r);
+            if (row == null || isHiddenRow(row) || isTotalRow(row, fmt)) {
+                continue;
+            }
+            if (isDataRowByKeyColumns(row, fmt, keyColumnInfo, editableColumns)) {
+                return r;
+            }
+        }
+        return -1;
+    }
+
+    private int findLastDataRow(Sheet sheet,
+                                int startRow,
+                                DataFormatter fmt,
+                                KeyColumnInfo keyColumnInfo,
+                                List<Integer> editableColumns) {
+        if (sheet == null) {
+            return -1;
+        }
+        int last = sheet.getLastRowNum();
+        for (int r = last; r >= startRow; r--) {
+            Row row = sheet.getRow(r);
+            if (row == null || isHiddenRow(row) || isTotalRow(row, fmt)) {
+                continue;
+            }
+            if (isDataRowByKeyColumns(row, fmt, keyColumnInfo, editableColumns)) {
+                return r;
+            }
+        }
+        return -1;
+    }
     private List<Integer> resolveEditableColumnIndexes(TemplateDefinition template, Map<String, Integer> columnMap) {
         if (template == null || columnMap == null || columnMap.isEmpty()) {
             return List.of();
@@ -610,7 +730,7 @@ public class ExcelMergeService {
 
     private KeyColumnInfo resolveKeyColumnInfo(TemplateDefinition template, Map<String, Integer> columnMap) {
         if (template == null || columnMap == null || columnMap.isEmpty()) {
-            return new KeyColumnInfo(List.of(), List.of(), DEFAULT_KEY_FIELD_MIN_HITS);
+            return new KeyColumnInfo(List.of(), List.of(), List.of(), DEFAULT_KEY_FIELD_MIN_HITS);
         }
         List<String> anchorKeywords = loadKeywords(ANCHOR_KEYWORDS_PROPERTY, DEFAULT_ANCHOR_KEYWORDS);
         List<String> keyKeywords = loadKeywords(KEY_FIELD_KEYWORDS_PROPERTY, DEFAULT_KEY_FIELD_KEYWORDS);
@@ -619,6 +739,7 @@ public class ExcelMergeService {
 
         LinkedHashSet<Integer> anchorIndexes = new LinkedHashSet<>();
         LinkedHashSet<Integer> keyIndexes = new LinkedHashSet<>();
+        LinkedHashSet<Integer> dataIndexes = new LinkedHashSet<>();
         for (String header : template.normalizedHeaders()) {
             if (header == null || header.isBlank()) {
                 continue;
@@ -630,6 +751,7 @@ public class ExcelMergeService {
             if (col == null) {
                 continue;
             }
+            dataIndexes.add(col);
             if (containsKeyword(header, anchorKeywords)) {
                 anchorIndexes.add(col);
                 continue;
@@ -638,7 +760,8 @@ public class ExcelMergeService {
                 keyIndexes.add(col);
             }
         }
-        return new KeyColumnInfo(new ArrayList<>(anchorIndexes), new ArrayList<>(keyIndexes), minHits);
+        return new KeyColumnInfo(new ArrayList<>(anchorIndexes), new ArrayList<>(keyIndexes),
+                new ArrayList<>(dataIndexes), minHits);
     }
 
     private List<String> resolveCoreHeaders(TemplateDefinition template) {
@@ -1231,7 +1354,7 @@ public class ExcelMergeService {
             return false;
         }
         if (keyColumnInfo == null) {
-            return hasEditableValue(row, fmt, editableColumns);
+            return false;
         }
         List<Integer> anchorColumns = keyColumnInfo.anchorColumns();
         if (anchorColumns != null && !anchorColumns.isEmpty()) {
@@ -1261,7 +1384,22 @@ public class ExcelMergeService {
             }
             return hits >= keyColumnInfo.minHits();
         }
-        return hasEditableValue(row, fmt, editableColumns);
+        List<Integer> dataColumns = keyColumnInfo.dataColumns();
+        if (dataColumns == null || dataColumns.isEmpty()) {
+            return false;
+        }
+        int hits = 0;
+        for (Integer col : dataColumns) {
+            if (col == null) {
+                continue;
+            }
+            Cell cell = row.getCell(col);
+            String value = cell == null ? "" : fmt.formatCellValue(cell).trim();
+            if (!value.isBlank()) {
+                hits++;
+            }
+        }
+        return hits >= 2;
     }
 
     private boolean isTotalRow(Row row, DataFormatter fmt) {
@@ -1328,7 +1466,9 @@ public class ExcelMergeService {
 
     private record KeyColumnInfo(List<Integer> anchorColumns,
                                  List<Integer> keyColumns,
+                                 List<Integer> dataColumns,
                                  int minHits) {
     }
+
 
 }
