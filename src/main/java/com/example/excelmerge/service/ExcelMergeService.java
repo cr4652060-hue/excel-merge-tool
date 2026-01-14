@@ -37,16 +37,50 @@ public class ExcelMergeService {
     private static final Pattern INSTRUCTION_KEYWORDS = Pattern.compile(
             ".*(填写|说明|注意|示例|要求|口径|备注|提示|温馨提示|如实|以下|请按|请填写|填报|填表|规则|校验|检查).*"
     );
-    private static final List<String> KEY_FIELD_KEYWORDS = List.of(
-            "设备类型及名称",
-            "设备类型名称",
+    private static final String ANCHOR_KEYWORDS_PROPERTY = "excel.merge.keywords.anchors";
+    private static final String KEY_FIELD_KEYWORDS_PROPERTY = "excel.merge.keywords.keys";
+    private static final String EXCLUDED_KEYWORDS_PROPERTY = "excel.merge.keywords.excludes";
+    private static final String TOTAL_KEYWORDS_PROPERTY = "excel.merge.keywords.totals";
+    private static final String KEY_FIELD_MIN_HITS_PROPERTY = "excel.merge.keywords.minHits";
+
+    private static final List<String> DEFAULT_ANCHOR_KEYWORDS = List.of(
+            "账号",
+            "卡号",
+            "证件号",
+            "设备序列号",
+            "资产编号",
+            "设备编号"
+    );
+    private static final List<String> DEFAULT_KEY_FIELD_KEYWORDS = List.of(
+            "姓名",
+            "单位",
+            "网点",
+            "部门",
+            "金额",
+            "数量",
+            "用途",
+            "存放地点",
+            "管理员",
+            "项目",
+            "指标",
             "设备类型",
             "规格型号",
-            "设备序列号",
-            "设备序号",
-            "管理人",
-            "使用人"
+            "设备名称",
+            "资产名称"
     );
+    private static final List<String> DEFAULT_EXCLUDED_KEYWORDS = List.of(
+            "序号",
+            "序次",
+            "行号",
+            "备注",
+            "说明",
+            "填报人",
+            "填表人",
+            "填报日期",
+            "填表日期"
+    );
+    private static final List<String> DEFAULT_TOTAL_KEYWORDS = List.of("小计", "合计", "总计");
+    private static final int DEFAULT_KEY_FIELD_MIN_HITS = 2;
     private final AtomicReference<TemplateDefinition> templateRef = new AtomicReference<>();
     private final AtomicReference<List<List<String>>> mergedRowsRef = new AtomicReference<>();
     private final List<TemplateRule> templateRules = loadTemplateRules();
@@ -164,6 +198,7 @@ public class ExcelMergeService {
 
                 DataFormatter fmt = new DataFormatter();
                 List<Integer> editableColumns = resolveEditableColumnIndexes(template, columnMap);
+                KeyColumnInfo keyColumnInfo = resolveKeyColumnInfo(template, columnMap);
                 int emptyEditableStreak = 0;
                 for (int r = headerRowIndex + 1; r <= sheet.getLastRowNum(); r++) {
                     Row row = sheet.getRow(r);
@@ -183,8 +218,11 @@ public class ExcelMergeService {
                         continue;
                     }
 
-                    // ✅ 3) 仅当可编辑列有值时才算数据行（B 版保守模式）
-                    if (!hasEditableValue(row, fmt, editableColumns)) {
+                    // ✅ 3) 关键字段命中判定数据行（默认规则 + 可配置关键词）
+                    if (isTotalRow(row, fmt)) {
+                        break;
+                    }
+                    if (!isDataRowByKeyColumns(row, fmt, keyColumnInfo, editableColumns)) {
                         if (shouldStopByInvalidRow(++emptyEditableStreak)) {
                             break;
                         }
@@ -570,38 +608,37 @@ public class ExcelMergeService {
         return null;
     }
 
-    private List<Integer> resolveKeyColumns(TemplateDefinition template, Map<String, Integer> columnMap) {
+    private KeyColumnInfo resolveKeyColumnInfo(TemplateDefinition template, Map<String, Integer> columnMap) {
         if (template == null || columnMap == null || columnMap.isEmpty()) {
-            return List.of();
+            return new KeyColumnInfo(List.of(), List.of(), DEFAULT_KEY_FIELD_MIN_HITS);
         }
-        LinkedHashSet<Integer> indexes = new LinkedHashSet<>();
+        List<String> anchorKeywords = loadKeywords(ANCHOR_KEYWORDS_PROPERTY, DEFAULT_ANCHOR_KEYWORDS);
+        List<String> keyKeywords = loadKeywords(KEY_FIELD_KEYWORDS_PROPERTY, DEFAULT_KEY_FIELD_KEYWORDS);
+        List<String> excludedKeywords = loadKeywords(EXCLUDED_KEYWORDS_PROPERTY, DEFAULT_EXCLUDED_KEYWORDS);
+        int minHits = loadMinKeyHits();
+
+        LinkedHashSet<Integer> anchorIndexes = new LinkedHashSet<>();
+        LinkedHashSet<Integer> keyIndexes = new LinkedHashSet<>();
         for (String header : template.normalizedHeaders()) {
             if (header == null || header.isBlank()) {
                 continue;
             }
-            if (isSerialHeader(header)) {
+            if (isExcludedHeaderForRowDetection(header, excludedKeywords)) {
                 continue;
             }
-            if (isKeyFieldHeader(header)) {
-                Integer col = columnMap.get(header);
-                if (col != null) {
-                    indexes.add(col);
-                }
+            Integer col = columnMap.get(header);
+            if (col == null) {
+                continue;
+            }
+            if (containsKeyword(header, anchorKeywords)) {
+                anchorIndexes.add(col);
+                continue;
+            }
+            if (containsKeyword(header, keyKeywords)) {
+                keyIndexes.add(col);
             }
         }
-        return new ArrayList<>(indexes);
-    }
-
-    private boolean isKeyFieldHeader(String normalizedHeader) {
-        if (normalizedHeader == null || normalizedHeader.isBlank()) {
-            return false;
-        }
-        for (String keyword : KEY_FIELD_KEYWORDS) {
-            if (normalizedHeader.contains(keyword)) {
-                return true;
-            }
-        }
-        return false;
+        return new KeyColumnInfo(new ArrayList<>(anchorIndexes), new ArrayList<>(keyIndexes), minHits);
     }
 
     private List<String> resolveCoreHeaders(TemplateDefinition template) {
@@ -656,6 +693,22 @@ public class ExcelMergeService {
         }
         String header = normalizedHeader.trim();
         return isSerialHeader(header) || FIXED_VALUE_HEADER_PATTERN.matcher(header).matches();
+    }
+    private boolean isExcludedHeaderForRowDetection(String normalizedHeader, List<String> excludedKeywords) {
+        if (normalizedHeader == null || normalizedHeader.isBlank()) {
+            return true;
+        }
+        String header = normalizedHeader.trim();
+        if (isSerialHeader(header)) {
+            return true;
+        }
+        if (FIXED_VALUE_HEADER_PATTERN.matcher(header).matches()) {
+            return true;
+        }
+        if (NON_CORE_HEADER_PATTERN.matcher(header).matches()) {
+            return true;
+        }
+        return containsKeyword(header, excludedKeywords);
     }
 
     // =========================
@@ -1170,6 +1223,112 @@ public class ExcelMergeService {
         // 兜底：全都空就返回第一个
         return best != null ? best : workbook.getSheetAt(0);
     }
+    private boolean isDataRowByKeyColumns(Row row,
+                                          DataFormatter fmt,
+                                          KeyColumnInfo keyColumnInfo,
+                                          List<Integer> editableColumns) {
+        if (row == null) {
+            return false;
+        }
+        if (keyColumnInfo == null) {
+            return hasEditableValue(row, fmt, editableColumns);
+        }
+        List<Integer> anchorColumns = keyColumnInfo.anchorColumns();
+        if (anchorColumns != null && !anchorColumns.isEmpty()) {
+            for (Integer col : anchorColumns) {
+                if (col == null) {
+                    continue;
+                }
+                Cell cell = row.getCell(col);
+                String value = cell == null ? "" : fmt.formatCellValue(cell).trim();
+                if (!value.isBlank()) {
+                    return true;
+                }
+            }
+        }
+        List<Integer> keyColumns = keyColumnInfo.keyColumns();
+        if (keyColumns != null && !keyColumns.isEmpty()) {
+            int hits = 0;
+            for (Integer col : keyColumns) {
+                if (col == null) {
+                    continue;
+                }
+                Cell cell = row.getCell(col);
+                String value = cell == null ? "" : fmt.formatCellValue(cell).trim();
+                if (!value.isBlank()) {
+                    hits++;
+                }
+            }
+            return hits >= keyColumnInfo.minHits();
+        }
+        return hasEditableValue(row, fmt, editableColumns);
+    }
 
+    private boolean isTotalRow(Row row, DataFormatter fmt) {
+        if (row == null) {
+            return false;
+        }
+        List<String> totals = loadKeywords(TOTAL_KEYWORDS_PROPERTY, DEFAULT_TOTAL_KEYWORDS);
+        for (int c = row.getFirstCellNum(); c < row.getLastCellNum(); c++) {
+            Cell cell = row.getCell(c);
+            String value = cell == null ? "" : fmt.formatCellValue(cell).trim();
+            if (value.isBlank()) {
+                continue;
+            }
+            if (containsKeyword(value, totals)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private List<String> loadKeywords(String propertyName, List<String> defaults) {
+        String raw = System.getProperty(propertyName);
+        if (raw == null || raw.isBlank()) {
+            return defaults;
+        }
+        String[] parts = raw.split("[,，;；]");
+        List<String> values = new ArrayList<>();
+        for (String part : parts) {
+            String trimmed = part == null ? "" : part.trim();
+            if (!trimmed.isBlank()) {
+                values.add(trimmed);
+            }
+        }
+        return values.isEmpty() ? defaults : values;
+    }
+
+    private int loadMinKeyHits() {
+        String raw = System.getProperty(KEY_FIELD_MIN_HITS_PROPERTY);
+        if (raw == null || raw.isBlank()) {
+            return DEFAULT_KEY_FIELD_MIN_HITS;
+        }
+        try {
+            int value = Integer.parseInt(raw.trim());
+            return Math.max(1, value);
+        } catch (NumberFormatException e) {
+            return DEFAULT_KEY_FIELD_MIN_HITS;
+        }
+    }
+
+    private boolean containsKeyword(String header, List<String> keywords) {
+        if (header == null || header.isBlank() || keywords == null || keywords.isEmpty()) {
+            return false;
+        }
+        for (String keyword : keywords) {
+            if (keyword == null || keyword.isBlank()) {
+                continue;
+            }
+            if (header.contains(keyword)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private record KeyColumnInfo(List<Integer> anchorColumns,
+                                 List<Integer> keyColumns,
+                                 int minHits) {
+    }
 
 }
