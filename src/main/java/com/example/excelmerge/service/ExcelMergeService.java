@@ -22,7 +22,7 @@ public class ExcelMergeService {
     private static final int HEADER_SCAN_LIMIT = 30;
     private static final int TYPE_SAMPLE_LIMIT = 50;
     private static final int PREVIEW_LIMIT = 500;
-    private static final int INVALID_ROW_LIMIT = 30;
+    private static final int INVALID_ROW_LIMIT = 5;
     private static final int EDITABLE_SAMPLE_LIMIT = 200;
     private static final double EDITABLE_FILL_RATE_THRESHOLD = 0.6;
     private static final double STATIC_FILL_RATE_THRESHOLD = 0.9;
@@ -81,6 +81,17 @@ public class ExcelMergeService {
     );
     private static final List<String> DEFAULT_TOTAL_KEYWORDS = List.of("小计", "合计", "总计");
     private static final int DEFAULT_KEY_FIELD_MIN_HITS = 2;
+    private static final Pattern ZERO_VALUE_PATTERN = Pattern.compile("^0+(\\.0+)?$");
+    private static final Set<String> DEFAULT_PLACEHOLDER_VALUES = Set.of(
+            "C",
+            "c",
+            "-",
+            "—",
+            "–",
+            "--",
+            "—-",
+            "/"
+    );
     private final AtomicReference<TemplateDefinition> templateRef = new AtomicReference<>();
     private final AtomicReference<List<List<String>>> mergedRowsRef = new AtomicReference<>();
     private final List<TemplateRule> templateRules = loadTemplateRules();
@@ -353,19 +364,13 @@ public class ExcelMergeService {
      */
     private boolean hasAnyMeaningfulEditableValue(Row row, DataFormatter fmt, List<Integer> editableColumns) {
         if (editableColumns == null || editableColumns.isEmpty()) return false;
-
-        // 常见的“模板固定默认值”，这些不能算“有意义”
-        // 账户类型经常默认 C，所以必须排除，否则空行也会被当数据
-        Set<String> fixedValues = new HashSet<>(Arrays.asList("C", "c"));
-
         for (Integer col : editableColumns) {
             if (col == null) continue;
             Cell cell = row.getCell(col);
             if (cell == null) continue;
 
             String v = fmt.formatCellValue(cell).trim();
-            if (v.isBlank()) continue;
-            if (fixedValues.contains(v)) continue;
+            if (!isMeaningfulValue(v)) continue;
 
             return true;
         }
@@ -1364,7 +1369,7 @@ public class ExcelMergeService {
                 }
                 Cell cell = row.getCell(col);
                 String value = cell == null ? "" : fmt.formatCellValue(cell).trim();
-                if (!value.isBlank()) {
+                if (isMeaningfulValue(value)) {
                     return true;
                 }
             }
@@ -1378,7 +1383,7 @@ public class ExcelMergeService {
                 }
                 Cell cell = row.getCell(col);
                 String value = cell == null ? "" : fmt.formatCellValue(cell).trim();
-                if (!value.isBlank()) {
+                if (isMeaningfulValue(value)) {
                     hits++;
                 }
             }
@@ -1395,13 +1400,26 @@ public class ExcelMergeService {
             }
             Cell cell = row.getCell(col);
             String value = cell == null ? "" : fmt.formatCellValue(cell).trim();
-            if (!value.isBlank()) {
+            if (isMeaningfulValue(value)) {
                 hits++;
             }
         }
         return hits >= 2;
     }
-
+    private boolean isMeaningfulValue(String value) {
+        if (value == null) {
+            return false;
+        }
+        String trimmed = value.trim();
+        if (trimmed.isBlank()) {
+            return false;
+        }
+        if (DEFAULT_PLACEHOLDER_VALUES.contains(trimmed)) {
+            return false;
+        }
+        String normalized = trimmed.replace(",", "");
+        return !ZERO_VALUE_PATTERN.matcher(normalized).matches();
+    }
     private boolean isTotalRow(Row row, DataFormatter fmt) {
         if (row == null) {
             return false;
